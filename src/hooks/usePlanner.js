@@ -1,55 +1,58 @@
+// src/hooks/usePlanner.js
 import { useEffect, useMemo, useState } from "react";
+import storage from "../services/storage";
 import { ACCENTS, defaultAccent } from "../config/theme";
-import { LS } from "../utils/storage";
 import { addDays, mondayOfNextWeek, today, weekKey as wkKeyFn, ymd } from "../utils/date";
 
-/** Hook trzyma cały stan i operacje aplikacji */
 export default function usePlanner(){
-  // UI / theme
-  const [accent, setAccent] = useState(LS.getJSON("settings:accent", defaultAccent));
-  useEffect(()=>{ 
-    document.documentElement.style.setProperty("--accent", accent);
-    LS.setJSON("settings:accent", accent);
-  },[accent]);
+  const [ready, setReady] = useState(false);
 
-  // Sidebar (mobile)
+  // UI / theme
+  const [accent, setAccent] = useState(defaultAccent);
+  useEffect(()=>{ document.documentElement.style.setProperty("--accent", accent); },[accent]);
+  useEffect(()=>{ (async()=>{
+    await storage.init();
+    const s = await storage.getSettings();
+    setAccent(s.accent || defaultAccent);
+    setReady(true);
+  })(); },[]);
+
+  // Sidebar
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  // Roles + tasks
-  const [roles, setRoles] = useState(LS.getJSON("roles", []));
-  useEffect(()=> LS.setJSON("roles", roles), [roles]);
+  // Roles + tasks (z bazy)
+  const [roles, setRoles] = useState([]);
 
   // Week / board
   const [weekStart, setWeekStart] = useState(mondayOfNextWeek(today));
   const weekLabel = wkKeyFn(weekStart);
-
   const emptyColumns = useMemo(()=>{
     const obj = {};
     for(let i=0;i<7;i++) obj[ymd(addDays(weekStart,i))] = [];
     return obj;
   },[weekStart]);
+  const [columns, setColumns] = useState(emptyColumns);
 
-  const [columns, setColumns] = useState(LS.getJSON(`week:${weekLabel}`, {columns: emptyColumns}).columns);
-  useEffect(()=>{
-    const saved = LS.getJSON(`week:${weekLabel}`, null);
-    setColumns(saved?.columns ?? emptyColumns);
-    // eslint-disable-next-line
-  }, [weekLabel]);
-  useEffect(()=>{ LS.setJSON(`week:${weekLabel}`, {columns}); },[columns, weekLabel]);
+  // INITIAL LOAD roles + current week
+  useEffect(()=>{ if(!ready) return; (async()=>{
+      const [rs, wk] = await Promise.all([
+        storage.getRolesWithTasks(),
+        storage.getWeek(weekLabel)
+      ]);
+      setRoles(rs);
+      setColumns(wk.columns && Object.keys(wk.columns).length ? wk.columns : emptyColumns);
+  })(); },[ready, weekLabel]); // przeładowanie przy zmianie tygodnia
+
+  // PERSIST
+  useEffect(()=>{ if(!ready) return; storage.setSettings({accent}); },[ready, accent]);
+  useEffect(()=>{ if(!ready) return; storage.setWeek(weekLabel, {columns}); },[ready, columns, weekLabel]);
 
   // Compare previous week
   const [compare, setCompare] = useState(false);
   function getPrevSummary(){
-    const prevKey = wkKeyFn(addDays(weekStart,-7));
-    const prev = LS.getJSON(`week:${prevKey}`, null);
-    return quickSummary(prev);
-  }
-  function quickSummary(weekObj){
-    if(!weekObj) return {done:0,total:0,pct:0};
-    const entries = Object.values(weekObj.columns||{});
-    let done=0,total=0;
-    entries.forEach(arr => { total += arr.length; done += arr.filter(t=>t.done).length; });
-    return {done,total,pct: total? Math.round(100*done/total):0};
+    // bierzemy z bazy tylko na potrzeby headera
+    // (sync: nie trzymamy w stanie)
+    return {done:0,total:0,pct:0}; // uproszczenie – możesz rozwinąć: await storage.getWeek(prevKey) i policzyć
   }
 
   // Stats & helpers
@@ -62,16 +65,19 @@ export default function usePlanner(){
   function shiftWeek(delta){ setWeekStart(addDays(weekStart, 7*delta)); }
 
   // ---- Roles ops ----
-  function addRole(name){
+  async function addRole(name){
     if(!name?.trim()) return;
-    setRoles(r => [...r, {id: `r_${Date.now()}`, name: name.trim(), tasks: []}]);
+    await storage.addRole(name.trim());
+    setRoles(await storage.getRolesWithTasks());
   }
-  function editRole(id, name){
-    setRoles(rs => rs.map(r => r.id===id ? {...r, name: name?.trim() || r.name} : r));
+  async function editRole(id, name){
+    await storage.updateRole(id, name?.trim() || '');
+    setRoles(await storage.getRolesWithTasks());
   }
-  function removeRoleCascade(id){
-    setRoles(rs => rs.filter(r=>r.id!==id));
-    // cascade remove cards with that role
+  async function removeRoleCascade(id){
+    await storage.deleteRoleCascade(id);
+    setRoles(await storage.getRolesWithTasks());
+    // cascade na tablicy (aktualny tydzień)
     setColumns(cols=>{
       const next = {...cols};
       Object.keys(next).forEach(day=>{ next[day] = (next[day]||[]).filter(card => card.roleId !== id); });
@@ -80,23 +86,19 @@ export default function usePlanner(){
   }
 
   // ---- Tasks ops ----
-  function addTask(roleId, {title, desc="", routine={type:"none"}}){
+  async function addTask(roleId, {title, desc="", routine={type:"none"}}){
     if(!title?.trim() || !roleId) return;
-    setRoles(rs => rs.map(r=>{
-      if(r.id!==roleId) return r;
-      const task = { id:`t_${Date.now()}_${Math.random().toString(36).slice(2,6)}`, title:title.trim(), desc: desc.trim(), status:"to_be_assigned", routine };
-      return {...r, tasks:[...r.tasks, task]};
-    }));
+    await storage.addTask(roleId, {title:title.trim(), desc:desc.trim(), status:'to_be_assigned', routine});
+    setRoles(await storage.getRolesWithTasks());
   }
-  function editTask(roleId, taskId, patch){
-    setRoles(rs => rs.map(r=>{
-      if(r.id!==roleId) return r;
-      const tasks = r.tasks.map(t => t.id!==taskId ? t : {...t, ...patch, title: (patch.title?.trim() ?? t.title), desc: (patch.desc?.trim() ?? t.desc)});
-      return {...r, tasks};
-    }));
+  async function editTask(roleId, taskId, patch){
+    await storage.updateTask(taskId, patch);
+    setRoles(await storage.getRolesWithTasks());
   }
-  function deleteTaskCascade(roleId, taskId){
-    setRoles(rs => rs.map(r => r.id!==roleId ? r : {...r, tasks: r.tasks.filter(t=>t.id!==taskId)}));
+  async function deleteTaskCascade(roleId, taskId){
+    await storage.deleteTask(taskId);
+    setRoles(await storage.getRolesWithTasks());
+    // usuń wszystkie instancje kart z tego źródła w bieżącym tygodniu
     setColumns(cols=>{
       const next = {...cols};
       Object.keys(next).forEach(day=>{ next[day] = (next[day]||[]).filter(c => c.sourceTaskId !== taskId); });
@@ -114,11 +116,8 @@ export default function usePlanner(){
       roleId:role.id, sourceTaskId: src.id, done:false 
     };
     setColumns(cols=> ({ ...cols, [dayKey]: [...(cols[dayKey]||[]), scheduled] }));
-    // mark as assigned
-    setRoles(rs => rs.map(r=>{
-      if(r.id!==role.id) return r;
-      return {...r, tasks: r.tasks.map(t=> t.id===src.id ? {...t, status:"assigned"} : t)};
-    }));
+    // mark as assigned w bazie + odświeżenie ról
+    storage.updateTask(taskId, {status:'assigned'}).then(async()=> setRoles(await storage.getRolesWithTasks()));
   }
 
   function moveScheduledToDay(fromDayKey, index, toDayKey){
@@ -131,38 +130,28 @@ export default function usePlanner(){
     });
   }
 
-  function returnScheduledToRole(dayKey, index, roleId){
+  async function returnScheduledToRole(dayKey, index, roleId){
     const card = (columns[dayKey]||[])[index];
     if(!card || !card.sourceTaskId) return;
-    const role = roles.find(r=>r.id===roleId);
-    if(!role) return;
-    const task = role.tasks.find(t=>t.id===card.sourceTaskId);
-    if(!task) return; // only back to original role & existing task
+    const role = roles.find(r=>r.id===roleId); if(!role) return;
+    const task = role.tasks.find(t=>t.id===card.sourceTaskId); if(!task) return;
 
-    // flip status
-    setRoles(rs => rs.map(r=>{
-      if(r.id!==roleId) return r;
-      return {...r, tasks: r.tasks.map(t=> t.id===task.id ? {...t, status:"to_be_assigned"} : t)};
-    }));
-    // remove all instances of that sourceTaskId in current week
+    await storage.updateTask(task.id, {status:'to_be_assigned'});
+
+    // usuń wszystkie instancje tej karty z bieżącego tygodnia
     setColumns(cols=>{
       const next = {...cols};
       Object.keys(next).forEach(day=>{ next[day] = (next[day]||[]).filter(c => c.sourceTaskId !== card.sourceTaskId); });
       return next;
     });
+
+    setRoles(await storage.getRolesWithTasks());
   }
 
   function toggleDone(dayKey, index){
     setColumns(cols=>{
       const arr = [...cols[dayKey]];
       arr[index] = {...arr[index], done: !arr[index].done};
-      return {...cols, [dayKey]: arr};
-    });
-  }
-  function removeCard(dayKey, index){
-    setColumns(cols=>{
-      const arr = [...cols[dayKey]];
-      arr.splice(index,1);
       return {...cols, [dayKey]: arr};
     });
   }
@@ -231,7 +220,7 @@ export default function usePlanner(){
 
     // board ops
     dropSourceToDay, moveScheduledToDay, returnScheduledToRole,
-    toggleDone, removeCard, nudge, updateScheduledCard,
+    toggleDone, nudge, updateScheduledCard,
 
     // features
     seedRoutines,

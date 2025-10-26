@@ -1,3 +1,5 @@
+// outdated and not used
+
 export const LS = {
   getJSON: (k, fallback) => {
     try { const s = localStorage.getItem(k); return s ? JSON.parse(s) : fallback; }

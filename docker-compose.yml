@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  # Produkcja: serwowanie przez Nginx
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+    profiles: ["prod"]
+    restart: unless-stopped
+
+  # Development: Vite + HMR
+  dev:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm ci --no-audit --no-fund && npm run dev -- --host 0.0.0.0 --port 5173"
+    ports:
+      - "5173:5173"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    environment:
+      # pomaga przy Docker Desktop na Windows/Mac, gdy HMR nie łapie
+      - CHOKIDAR_USEPOLLING=true
+    profiles: ["dev"]
